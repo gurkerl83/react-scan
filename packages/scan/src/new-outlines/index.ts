@@ -32,6 +32,7 @@ import {
   updateOutlines,
   updateScroll,
 } from './canvas';
+import { WebGPUContext, initWebGPU, drawRectangles, resize } from './webgpu';
 import type { ActiveOutline, BlueprintOutline, OutlineData } from './types';
 import { getChangedPropsDetailed } from '~web/views/inspector/utils';
 
@@ -41,6 +42,7 @@ const workerCode = '__WORKER_CODE__';
 let worker: Worker | null = null;
 let canvas: HTMLCanvasElement | null = null;
 let ctx: CanvasRenderingContext2D | null = null;
+let webgpu: WebGPUContext | null = null;
 let dpr = 1;
 let animationFrameId: number | null = null;
 const activeOutlines = new Map<string, ActiveOutline>();
@@ -259,6 +261,11 @@ export const flushOutlines = async () => {
           data: arrayBuffer,
           names: blueprintNames,
         });
+      } else if (webgpu && outlineData) {
+        updateOutlines(activeOutlines, outlineData);
+        if (!animationFrameId) {
+          animationFrameId = requestAnimationFrame(draw);
+        }
       } else if (canvas && ctx && outlineData) {
         updateOutlines(activeOutlines, outlineData);
         if (!animationFrameId) {
@@ -275,6 +282,24 @@ export const flushOutlines = async () => {
 };
 
 const draw = () => {
+  if (webgpu) {
+    const outlines = Array.from(activeOutlines.values()).map((o) => ({
+      x: o.x,
+      y: o.y,
+      width: o.width,
+      height: o.height,
+    }));
+    // Re-render all outlines using WebGPU. The GPU only stores vertices, so
+    // we regenerate them each frame based on the current outline data.
+    drawRectangles(webgpu, outlines);
+    if (activeOutlines.size > 0) {
+      animationFrameId = requestAnimationFrame(draw);
+    } else {
+      animationFrameId = null;
+    }
+    return;
+  }
+
   if (!ctx || !canvas) return;
 
   const shouldContinue = drawCanvas(ctx, canvas, dpr, activeOutlines);
@@ -288,6 +313,9 @@ const draw = () => {
 
 const IS_OFFSCREEN_CANVAS_WORKER_SUPPORTED =
   typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined';
+// WebGPU rendering runs on the main thread; we don't spawn a worker for it
+// like we do with the canvas 2D path.
+const IS_WEBGPU_SUPPORTED = typeof navigator !== 'undefined' && !!navigator.gpu;
 
 const getDpr = () => {
   return Math.min(window.devicePixelRatio || 1, 2);
@@ -321,6 +349,20 @@ export const getCanvasEl = () => {
   canvasEl.width = width;
   canvasEl.height = height;
 
+  if (IS_WEBGPU_SUPPORTED) {
+    // WebGPU does not use a worker, so initialization happens here and
+    // rendering is driven from the main thread.
+    initWebGPU(canvasEl)
+      .then((ctx) => {
+        if (ctx) {
+          webgpu = ctx;
+        }
+      })
+      .catch((e) => {
+        console.warn('Failed to initialize WebGPU:', e);
+      });
+  }
+
   if (
     IS_OFFSCREEN_CANVAS_WORKER_SUPPORTED &&
     !window.__REACT_SCAN_EXTENSION__
@@ -349,7 +391,7 @@ export const getCanvasEl = () => {
     }
   }
 
-  if (!worker) {
+  if (!worker && !IS_WEBGPU_SUPPORTED) {
     ctx = initCanvas(canvasEl, dpr) as CanvasRenderingContext2D;
   }
 
@@ -371,6 +413,11 @@ export const getCanvasEl = () => {
             height,
             dpr,
           });
+        } else if (webgpu) {
+          // WebGPU resizing happens here on the main thread. After adjusting
+          // the canvas size we simply redraw the outlines.
+          resize(webgpu, width * dpr, height * dpr);
+          draw();
         } else {
           canvasEl.width = width * dpr;
           canvasEl.height = height * dpr;
@@ -409,6 +456,11 @@ export const getCanvasEl = () => {
           requestAnimationFrame(
             updateScroll.bind(null, activeOutlines, deltaX, deltaY),
           );
+          if (webgpu) {
+            // The outlines positions are updated in updateScroll(). We simply
+            // trigger a redraw; no extra scroll information is sent to the GPU.
+            draw();
+          }
         }
         isScrollScheduled = false;
       }, 16 * 2);
